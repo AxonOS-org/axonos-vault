@@ -1,0 +1,20 @@
+[package]
+name = "axonos-vault"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Raw neural data does not leave. Only bounded, purpose-bound, budgeted reductions do — and every one is recorded."
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/AxonOS-org/axonos-vault"
+keywords = ["bci", "privacy", "no-std", "consent", "neural"]
+categories = ["embedded", "no-std"]
+
+[dependencies]
+# axonos-hal is not on crates.io yet, so the dependency is pinned to the tag.
+axonos-hal = { git = "https://github.com/AxonOS-org/axonos-hal", tag = "v0.1.0", default-features = false }
+
+[dev-dependencies]
+axonos-hal = { git = "https://github.com/AxonOS-org/axonos-hal", tag = "v0.1.0", features = ["sim"] }
+
+[profile.release]
+panic = "abort"
