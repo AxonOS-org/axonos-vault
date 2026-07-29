@@ -73,6 +73,15 @@ pub const MAX_DISCLOSURE: usize = 16;
 /// Bits charged per scalar released.
 pub const BITS_PER_SCALAR: u32 = 32;
 
+/// Bits charged for a refusal that depended on the sealed window (RFC-0009 U2).
+///
+/// The answer such a refusal carries is one bit — whether the window holds
+/// anything. It is charged a full scalar because a conservative price on a
+/// side channel is the correct direction to err, and because a cheaper probe
+/// would be a cheaper way to ask a question the interface was not meant to
+/// answer.
+pub const PROBE_COST_BITS: u32 = BITS_PER_SCALAR;
+
 /// What a disclosure is for.
 ///
 /// Purpose is declared by the grant and checked at release. An application
@@ -374,6 +383,8 @@ pub struct Vault {
     log_len: usize,
     /// Disclosures refused, by any cause — a rising count is a signal in itself.
     refusals: u32,
+    /// Content-dependent refusals, charged per U2.
+    probes: u32,
 }
 
 impl Default for Vault {
@@ -391,6 +402,7 @@ impl Vault {
             log: [None; LOG_CAPACITY],
             log_len: 0,
             refusals: 0,
+            probes: 0,
         }
     }
 
@@ -404,12 +416,52 @@ impl Vault {
         self.sealed.len()
     }
 
+    /// Bits the vault can still record, given free log entries.
+    ///
+    /// Each release consumes one entry and costs at least [`BITS_PER_SCALAR`],
+    /// so free entries × that minimum is the most that can be disclosed and
+    /// recorded from here. RFC-0009 N5.
+    pub const fn recordable_bits(&self) -> u32 {
+        ((LOG_CAPACITY - self.log_len) as u32) * BITS_PER_SCALAR
+    }
+
+    /// Bits already promised to live grants and not yet spent.
+    pub fn committed_bits(&self) -> u32 {
+        self.grants
+            .iter()
+            .flatten()
+            .filter(|g| !g.revoked)
+            .map(|g| g.remaining_bits())
+            .fold(0u32, |a, b| a.saturating_add(b))
+    }
+
     /// Install a grant, replacing any grant with the same id.
     ///
-    /// Returns `false` when there is no room — grants are refused rather than
-    /// evicting an existing one, because evicting a grant silently widens the
-    /// total budget in flight.
+    /// Refused when there is no slot, and — RFC-0009 N5 — when the budget could
+    /// not be spent within the vault's own recording capacity. A grant that
+    /// advertises a ceiling the vault will not honour is worse than a smaller
+    /// one: the number in it is not the binding constraint, and nobody reading
+    /// it can tell.
+    ///
+    /// Commitments are summed across live grants, because capacity is shared.
+    /// Issuing two grants that individually fit and jointly do not is the same
+    /// defect one step later.
     pub fn issue(&mut self, g: Grant) -> bool {
+        let already = self.committed_bits();
+        let replacing = self
+            .grants
+            .iter()
+            .flatten()
+            .find(|x| x.id == g.id)
+            .map(|x| x.remaining_bits())
+            .unwrap_or(0);
+        if already - replacing.min(already) + g.budget_bits > self.recordable_bits() {
+            return false;
+        }
+        self.issue_unchecked(g)
+    }
+
+    fn issue_unchecked(&mut self, g: Grant) -> bool {
         for slot in self.grants.iter_mut() {
             if matches!(slot, Some(existing) if existing.id == g.id) {
                 *slot = Some(g);
@@ -488,11 +540,36 @@ impl Vault {
                 requested: purpose,
             });
         }
-        if reduction.is_empty() {
-            return self.refuse(Denial::EmptyReduction);
-        }
-        if reduction.support() == 0 {
-            return self.refuse(Denial::NoSupport);
+        // RFC-0009 U2. These two conditions are the only ones in the predicate
+        // that depend on the *window* rather than on grant state, so a
+        // requester could otherwise learn "is this device recording?" for free
+        // and without limit. The attempt is charged, which brings the channel
+        // under Theorem 1 with everything else: a probe costs bits, and bits
+        // are finite.
+        //
+        // Only content-dependent refusals are charged. A request that fails on
+        // withdrawal, expiry or purpose costs nothing, because it reveals only
+        // what the requester already knew — and charging those would let a
+        // malformed client exhaust a budget that belongs to the subject.
+        if reduction.is_empty() || reduction.support() == 0 {
+            let d = if reduction.is_empty() {
+                Denial::EmptyReduction
+            } else {
+                Denial::NoSupport
+            };
+            let remaining = {
+                let g = self.grants[idx].as_ref().expect("checked above");
+                g.remaining_bits()
+            };
+            if remaining < PROBE_COST_BITS {
+                return self.refuse(Denial::BudgetExhausted {
+                    needed_bits: PROBE_COST_BITS,
+                    remaining_bits: remaining,
+                });
+            }
+            self.grants[idx].as_mut().expect("checked above").spent_bits += PROBE_COST_BITS;
+            self.probes = self.probes.saturating_add(1);
+            return self.refuse(d);
         }
 
         let cost = reduction.cost_bits();
@@ -549,6 +626,11 @@ impl Vault {
     /// Releases refused, for any reason.
     pub const fn refusals(&self) -> u32 {
         self.refusals
+    }
+
+    /// Content-dependent refusals — window probes — charged per RFC-0009 U2.
+    pub const fn probes(&self) -> u32 {
+        self.probes
     }
 
     /// Destroy the sealed window. Grants and the audit record survive: the

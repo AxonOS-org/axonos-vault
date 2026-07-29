@@ -4,7 +4,7 @@
 
 ### Raw neural data does not leave. Bounded reductions of it might.
 
-[![Tests](https://img.shields.io/badge/tests-19%20passing-0d7a5f?style=flat-square)](tests/boundary.rs)
+[![Tests](https://img.shields.io/badge/tests-27%20passing-0d7a5f?style=flat-square)](tests/boundary.rs)
 [![no_std](https://img.shields.io/badge/no__std-yes-0a4a8f?style=flat-square)](#constraints)
 [![unsafe](https://img.shields.io/badge/unsafe-forbidden-0a4a8f?style=flat-square)](#constraints)
 [![Allocation](https://img.shields.io/badge/allocation-none-0a4a8f?style=flat-square)](#constraints)
@@ -38,7 +38,7 @@ and only then hands anything back.
 
 ```rust
 let mut vault = Vault::new();
-vault.issue(Grant::new(1, Purpose::QualityFeedback, 3_200, expiry));
+vault.issue(Grant::new(1, Purpose::QualityFeedback, 2_048, expiry));
 
 vault.admit(frame);                                  // raw enters, never returns
 
@@ -80,12 +80,40 @@ the same problem wearing different clothes.
 | Revoked | terminal; outranks every other reason, so an audit reads the true cause |
 | Expired | `not_after` is inclusive |
 | Purpose | mismatch names both sides — a calibration grant cannot be spent on telemetry |
-| Substance | an empty reduction, or one over an empty window, is refused rather than released as zero |
+| Substance | an empty reduction, or one over an empty window, is refused **and charged** — see below |
 | Budget | refused with the exact shortfall in bits |
 | Record | when the audit log is full, releases **stop** — an unrecorded disclosure is worse than a refused one |
 
-`purge()` destroys the sealed window and leaves the record intact: the point of
-the record is that it outlives the data it describes.
+### The budget must be spendable (RFC-0009 N5)
+
+A grant is refused at issue time if its budget could not be spent within the
+vault's own recording capacity. With a 64-entry log and a 32-bit minimum
+charge, the most any set of live grants may promise is **2 048 bits**, and
+commitments are summed across grants because the capacity is shared.
+
+v0.1.1 issued 3 200-bit grants against that same 64-entry log, so the
+advertised ceiling was not the binding one and nobody reading the grant could
+tell. The defect was found by running the organs together in `axonos-stack`,
+not by testing the vault alone.
+
+### Probing the window is not free (RFC-0009 U2)
+
+Two conditions in the release predicate depend on the *window* rather than on
+grant state: an empty reduction and one with no support. Both fail exactly when
+the device is not recording — so a requester could otherwise ask "is this
+device live?" at no cost and without limit.
+
+That attempt is now charged. The channel comes under the same ceiling as
+everything else, and the bound is visible:
+
+```
+liveness_polling_is_bounded_by_the_budget ... ok
+  1000 probes against a 128-bit grant → 4 answers, then BudgetExhausted
+```
+
+Refusals that depend only on grant state stay free. Charging those would let a
+malformed client drain a budget belonging to the subject, and they reveal only
+what the requester already knew.
 
 ## What this does not claim
 

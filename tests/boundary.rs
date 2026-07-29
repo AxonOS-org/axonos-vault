@@ -219,17 +219,23 @@ fn every_disclosure_is_recorded_with_its_terms() {
 #[test]
 fn releases_stop_when_they_can_no_longer_be_recorded() {
     let mut v = filled(20);
-    v.issue(Grant::new(8, Purpose::LocalDiagnostics, u32::MAX, u64::MAX));
+    // the largest grant N5 permits: every free log entry at the minimum charge
+    assert!(v.issue(Grant::new(
+        8,
+        Purpose::LocalDiagnostics,
+        (LOG_CAPACITY as u32) * BITS_PER_SCALAR,
+        u64::MAX
+    )));
     for i in 0..LOG_CAPACITY {
         let r = v.reduce(ContactQuality::new());
         assert!(v.release(r, Purpose::LocalDiagnostics, 8, i as u64).is_ok());
     }
     let r = v.reduce(ContactQuality::new());
-    assert_eq!(
+    // budget and log capacity now reach zero together, which is what N5 is for
+    assert!(matches!(
         v.release(r, Purpose::LocalDiagnostics, 8, 999),
-        Err(Denial::LogFull),
-        "an unrecorded disclosure is worse than a refused one"
-    );
+        Err(Denial::LogFull) | Err(Denial::BudgetExhausted { .. })
+    ));
 }
 
 #[test]
@@ -281,7 +287,10 @@ fn a_real_acquisition_session_flows_through_the_boundary() {
     dev.configure(budget, Frontend::CANONICAL).unwrap();
 
     let mut v = Vault::new();
-    v.issue(Grant::new(1, Purpose::QualityFeedback, 3_200, u64::MAX));
+    assert!(
+        v.issue(Grant::new(1, Purpose::QualityFeedback, 2_048, u64::MAX)),
+        "2048 = 64 log entries x 32 bits, the most this vault can record"
+    );
 
     let mut admitted = 0u32;
     for _ in 0..1_000 {
@@ -322,4 +331,122 @@ fn lead_off_is_visible_through_the_boundary_without_the_signal_being() {
         &[40],
         "40 of 100 frames had a lifted electrode"
     );
+}
+
+// ── RFC-0009 N5: a grant must be spendable within the recording capacity ──
+
+#[test]
+fn a_grant_larger_than_the_log_can_record_is_refused() {
+    let mut v = filled(10);
+    // 64 entries x 32 bits = 2048; the 3200 the README once advertised is not
+    // spendable, and advertising it was the defect axonos-stack surfaced.
+    assert!(!v.issue(Grant::new(1, Purpose::Control, 3_200, u64::MAX)));
+    assert!(v.issue(Grant::new(1, Purpose::Control, 2_048, u64::MAX)));
+    assert!(v.grant(1).is_some());
+}
+
+#[test]
+fn capacity_is_shared_so_commitments_sum() {
+    let mut v = filled(10);
+    assert!(v.issue(Grant::new(1, Purpose::Control, 1_024, u64::MAX)));
+    assert!(v.issue(Grant::new(2, Purpose::Calibration, 1_024, u64::MAX)));
+    // both fit individually and jointly exhaust the capacity
+    assert!(
+        !v.issue(Grant::new(3, Purpose::Control, 32, u64::MAX)),
+        "issuing two that jointly overcommit is the same defect one step later"
+    );
+}
+
+#[test]
+fn reissuing_a_grant_releases_its_own_commitment() {
+    let mut v = filled(10);
+    assert!(v.issue(Grant::new(1, Purpose::Control, 2_048, u64::MAX)));
+    // replacing id 1 must not double-count the budget it already held
+    assert!(v.issue(Grant::new(1, Purpose::Calibration, 2_048, u64::MAX)));
+    assert_eq!(v.grant(1).unwrap().purpose, Purpose::Calibration);
+}
+
+#[test]
+fn recordable_capacity_shrinks_as_the_log_fills() {
+    let mut v = filled(10);
+    let before = v.recordable_bits();
+    v.issue(Grant::new(1, Purpose::QualityFeedback, 1_024, u64::MAX));
+    let r = v.reduce(ContactQuality::new());
+    v.release(r, Purpose::QualityFeedback, 1, 0).unwrap();
+    assert_eq!(v.recordable_bits(), before - BITS_PER_SCALAR);
+}
+
+// ── RFC-0009 U2: probing the window is no longer free ──
+
+#[test]
+fn probing_an_empty_window_costs_bits() {
+    let mut v = Vault::new();
+    v.issue(Grant::new(1, Purpose::QualityFeedback, 128, u64::MAX));
+    let r = v.reduce(ContactQuality::new());
+    assert_eq!(
+        v.release(r, Purpose::QualityFeedback, 1, 0),
+        Err(Denial::EmptyReduction)
+    );
+    assert_eq!(
+        v.grant(1).unwrap().spent_bits(),
+        PROBE_COST_BITS,
+        "the liveness answer is charged, so the channel is under the budget"
+    );
+    assert_eq!(v.probes(), 1);
+}
+
+#[test]
+fn liveness_polling_is_bounded_by_the_budget() {
+    // The attack U2 describes: ask repeatedly whether the device is recording.
+    let mut v = Vault::new();
+    v.issue(Grant::new(1, Purpose::QualityFeedback, 128, u64::MAX)); // 4 probes
+    let mut answered = 0;
+    for i in 0..1_000u64 {
+        let r = v.reduce(ContactQuality::new());
+        match v.release(r, Purpose::QualityFeedback, 1, i) {
+            Err(Denial::EmptyReduction) => answered += 1,
+            Err(Denial::BudgetExhausted { .. }) => break,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(
+        answered, 4,
+        "1000 probes, 4 answers — the channel is finite"
+    );
+    assert_eq!(v.grant(1).unwrap().remaining_bits(), 0);
+}
+
+#[test]
+fn a_refusal_on_grant_state_is_still_free() {
+    // Charging those would let a malformed client drain a budget that belongs
+    // to the subject, and they reveal only what the requester already knew.
+    let mut v = filled(10);
+    v.issue(Grant::new(1, Purpose::Control, 128, u64::MAX));
+    let r = v.reduce(ContactQuality::new());
+    assert_eq!(
+        v.release(r, Purpose::Calibration, 1, 0),
+        Err(Denial::PurposeMismatch {
+            granted: Purpose::Control,
+            requested: Purpose::Calibration
+        })
+    );
+    assert_eq!(v.grant(1).unwrap().spent_bits(), 0);
+    assert_eq!(v.probes(), 0);
+}
+
+#[test]
+fn a_probe_with_no_budget_left_reports_the_budget_not_the_window() {
+    let mut v = Vault::new();
+    v.issue(Grant::new(1, Purpose::QualityFeedback, 32, u64::MAX));
+    let r = v.reduce(ContactQuality::new());
+    assert_eq!(
+        v.release(r, Purpose::QualityFeedback, 1, 0),
+        Err(Denial::EmptyReduction)
+    );
+    let r2 = v.reduce(ContactQuality::new());
+    // now broke: the answer must not be given away as a consolation
+    assert!(matches!(
+        v.release(r2, Purpose::QualityFeedback, 1, 1),
+        Err(Denial::BudgetExhausted { .. })
+    ));
 }
