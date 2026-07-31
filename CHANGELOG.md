@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.2] — 2026-08-01
+
+### Changed
+- **Re-pinned `axonos-hal` to v0.3.0.** The stack moved to 0.3.0 for operating
+  points while this crate stayed on 0.2.0, which put two copies of the HAL in
+  one dependency graph — and two copies mean two distinct `SampleFrame` types
+  that cargo resolves without complaint and the compiler then refuses to unify.
+  The integration build caught it, which is the argument for having one.
+
+  Nothing here uses operating points; the pin moves so the graph has a single
+  HAL, which is a property the whole stack depends on and no individual crate
+  can observe.
+
 All notable changes to axonos-vault are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).

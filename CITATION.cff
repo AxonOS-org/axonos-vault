@@ -15,7 +15,7 @@ authors:
 repository-code: "https://github.com/AxonOS-org/axonos-vault"
 url: "https://axonos.org"
 abstract: "Raw neural data does not leave. Only bounded, purpose-bound, budgeted reductions do, and every one is recorded."
-version: 0.2.1
+version: 0.2.2
 date-released: "2026-08-01"
 license: "Apache-2.0 OR MIT"
 # Copyright 2026 Denis Yermakou. See NOTICE for attribution terms.
